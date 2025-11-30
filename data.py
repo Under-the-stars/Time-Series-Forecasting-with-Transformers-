@@ -21,7 +21,7 @@ def load_ticker_csv(path):
     df = pd.read_csv(path)
 
     # Convert Date column
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
     df = df.sort_values("Date").reset_index(drop=True)
 
     return df
@@ -42,7 +42,7 @@ def clean_and_select(df):
 
     df = df.copy()
 
-    df["Date"] = pd.to_datetime(df["Date"])
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
     df = df.sort_values("Date")
     df = df.set_index("Date")
 
