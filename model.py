@@ -1,167 +1,102 @@
 """
-train.py
-Training loop for multi-step Transformer forecasting
-compatible with Option C model and data.py windowing.
+model.py
+Multi-step TimeSeries Transformer (Option C)
+Fully compatible with Flax 0.8+ dropout API
 """
 
-import os
-import jax
 import jax.numpy as jnp
-import optax
-import numpy as np
-from flax.training import train_state, checkpoints
-
-from model import TimeSeriesTransformer
+import flax.linen as nn
 
 
 # ============================================================
-# Create Training State
+# Positional Encoding
 # ============================================================
-def create_train_state(rng, learning_rate, seq_len, out_len, num_features):
-    model = TimeSeriesTransformer(
-        seq_len=seq_len,
-        d_model=128,
-        num_heads=4,
-        num_layers=4,
-        mlp_dim=256,
-        out_len=out_len,
-        num_features=num_features,
-    )
 
-    dummy_input = jnp.ones((1, seq_len, num_features))
+class PositionalEncoding(nn.Module):
+    d_model: int
+    max_len: int = 5000
 
-    params = model.init(
-        {"params": rng, "dropout": rng},
-        dummy_input,
-        train=True
-    )["params"]
-
-    tx = optax.adamw(learning_rate)
-
-    return train_state.TrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        tx=tx
-    )
-
-
+    @nn.compact
+    def __call__(self, x):
+        pos_emb = self.param(
+            "pos_embedding",
+            nn.initializers.normal(stddev=0.02),
+            (self.max_len, self.d_model),
+        )
+        return x + pos_emb[:x.shape[1], :]
 
 
 # ============================================================
-# Loss Function
+# Transformer Block
 # ============================================================
 
-def loss_fn(params, batch, state):
-    preds = state.apply_fn(
-        {"params": params},
-        batch["X"],
-        train=True,
-        rngs={"dropout": jax.random.PRNGKey(0)}
-    )
-    return jnp.mean((preds - batch["y"]) ** 2)
+class TransformerBlock(nn.Module):
+    d_model: int
+    num_heads: int
+    mlp_dim: int
+    dropout: float = 0.1
 
+    @nn.compact
+    def __call__(self, x, train=True):
 
+        # ---- Multi-head Self Attention ----
+        attn = nn.SelfAttention(
+            num_heads=self.num_heads,
+            qkv_features=self.d_model,
+            dropout_rate=self.dropout
+        )
+        x2 = attn(x, deterministic=not train)
+        x = nn.LayerNorm()(x + x2)
 
-# ============================================================
-# Training Step
-# ============================================================
+        # ---- Feedforward ----
+        x2 = nn.Dense(self.mlp_dim)(x)
+        x2 = nn.gelu(x2)
+        x2 = nn.Dropout(self.dropout)(x2, deterministic=not train)
+        x2 = nn.Dense(self.d_model)(x2)
 
-@jax.jit
-def train_step(state, batch):
-    grads = jax.grad(loss_fn)(state.params, batch, state)
-    return state.apply_gradients(grads=grads)
-
-
-# ============================================================
-# Validation Step
-# ============================================================
-
-@jax.jit
-def eval_step(state, batch):
-    preds = state.apply_fn(
-        {"params": state.params},
-        batch["X"],
-        train=False,
-        rngs={"dropout": jax.random.PRNGKey(0)}
-    )
-    return jnp.mean((preds - batch["y"]) ** 2)
-
+        x = nn.LayerNorm()(x + x2)
+        return x
 
 
 # ============================================================
-# Batch Iterator
+# TimeSeries Transformer
 # ============================================================
 
-def get_batches(X, y, batch_size):
-    n = len(X)
-    idx = np.arange(n)
-    np.random.shuffle(idx)
+class TimeSeriesTransformer(nn.Module):
+    seq_len: int = 60
+    d_model: int = 128
+    num_heads: int = 4
+    num_layers: int = 4
+    mlp_dim: int = 256
+    dropout: float = 0.1
+    out_len: int = 5
+    num_features: int = 5
 
-    for i in range(0, n, batch_size):
-        batch_idx = idx[i:i + batch_size]
-        yield {
-            "X": jnp.array(X[batch_idx]),
-            "y": jnp.array(y[batch_idx]),
-        }
+    @nn.compact
+    def __call__(self, x, train=True):
+        """
+        x shape: (batch, seq_len, num_features)
+        """
 
+        # Project inputs to d_model
+        x = nn.Dense(self.d_model)(x)
 
-# ============================================================
-# Training Loop
-# ============================================================
+        # Add positional encoding
+        x = PositionalEncoding(self.d_model)(x)
 
-def train_model(
-    X_train, y_train,
-    X_val, y_val,
-    seq_len,
-    out_len,
-    num_features=5,
-    batch_size=64,
-    epochs=10,
-    learning_rate=1e-4,
-    ckpt_dir="./checkpoints"
-):
+        # Transformer layers
+        for _ in range(self.num_layers):
+            x = TransformerBlock(
+                self.d_model,
+                self.num_heads,
+                self.mlp_dim,
+                self.dropout
+            )(x, train=train)
 
-    os.makedirs(ckpt_dir, exist_ok=True)
+        # Final timestep representation
+        last = x[:, -1, :]  # (batch, d_model)
 
-    rng = jax.random.PRNGKey(0)
+        # Predict next 5 Close prices
+        out = nn.Dense(self.out_len)(last)
 
-    state = create_train_state(
-        rng,
-        learning_rate,
-        seq_len,
-        out_len,
-        num_features
-    )
-
-    best_val_loss = float("inf")
-
-    for epoch in range(1, epochs + 1):
-        # -------- TRAINING --------
-        train_losses = []
-        for batch in get_batches(X_train, y_train, batch_size):
-            state = train_step(state, batch)
-            train_losses.append(
-                float(loss_fn(state.params, batch, state))
-            )
-
-        train_loss = np.mean(train_losses)
-
-        # -------- VALIDATION --------
-        val_batch = {
-            "X": jnp.array(X_val),
-            "y": jnp.array(y_val)
-        }
-        val_loss = float(eval_step(state, val_batch))
-
-        print(f"Epoch {epoch}/{epochs} | Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f}")
-
-        # -------- CHECKPOINTING --------
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            checkpoints.save_checkpoint(
-                ckpt_dir, target=state.params, step=epoch, overwrite=True
-            )
-            print("   ✔ Saved new best checkpoint.")
-
-    print("Training complete.")
-    return state
+        return out
