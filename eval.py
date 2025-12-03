@@ -1,6 +1,6 @@
 """
 eval.py
-Final — correct import + matching architecture for checkpoint.
+Final — matching architecture (128-d) for checkpoint.
 """
 
 import sys
@@ -17,15 +17,15 @@ from src.model import TimeSeriesTransformer
 def load_model(ckpt_dir, seq_len, out_len, num_features=5):
     print("🔹 Loading best checkpoint...")
 
-    # EXACT SAME ARCHITECTURE AS TRAIN.PY
+    # MUST MATCH model.py EXACTLY:
     model = TimeSeriesTransformer(
         seq_len=seq_len,
-        d_model=256,
-        num_heads=8,
-        num_layers=6,
-        mlp_dim=512,
+        d_model=128,      # ← FIXED
+        num_heads=4,      # ← FIXED
+        num_layers=4,     # ← FIXED
+        mlp_dim=256,      # ← FIXED
         out_len=out_len,
-        dropout=0.15,
+        dropout=0.10,
         num_features=num_features,
     )
 
@@ -45,7 +45,7 @@ def predict(model, params, X_test):
     return model.apply(
         {"params": params},
         jnp.array(X_test),
-        train=False,
+        train=False, 
         rngs={"dropout": jax.random.PRNGKey(0)}
     )
 
@@ -55,11 +55,8 @@ def compute_metrics(y_true, y_pred):
 
     results = {}
     for h in range(y_true.shape[1]):
-        true_h = y_true[:, h]
-        pred_h = y_pred[:, h]
-
-        mae = float(np.mean(np.abs(true_h - pred_h)))
-        rmse = float(np.sqrt(np.mean((true_h - pred_h) ** 2)))
+        mae = float(np.mean(np.abs(y_true[:, h] - y_pred[:, h])))
+        rmse = float(np.sqrt(np.mean((y_true[:, h] - y_pred[:, h]) ** 2)))
 
         results[f"MAE_h{h+1}"] = mae
         results[f"RMSE_h{h+1}"] = rmse
