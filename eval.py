@@ -1,23 +1,23 @@
 """
 eval.py
-Evaluation + prediction for 5-step Transformer model.
+Final — correct import + matching architecture for checkpoint.
 """
+
+import sys
+sys.path.insert(0, "/content/Time-Series-Forecasting-with-Transformers-/src")
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax.training import checkpoints
 
-from model import TimeSeriesTransformer
+from src.model import TimeSeriesTransformer
 
 
-# ------------------------------------------------------------
-# Load model parameters (checkpoint)
-# ------------------------------------------------------------
 def load_model(ckpt_dir, seq_len, out_len, num_features=5):
     print("🔹 Loading best checkpoint...")
 
+    # EXACT SAME ARCHITECTURE AS TRAIN.PY
     model = TimeSeriesTransformer(
         seq_len=seq_len,
         d_model=256,
@@ -40,9 +40,6 @@ def load_model(ckpt_dir, seq_len, out_len, num_features=5):
     return model, params
 
 
-# ------------------------------------------------------------
-# Run predictions
-# ------------------------------------------------------------
 def predict(model, params, X_test):
     print("🔹 Predicting...")
     return model.apply(
@@ -53,34 +50,25 @@ def predict(model, params, X_test):
     )
 
 
-# ------------------------------------------------------------
-# Compute metrics horizon-by-horizon
-# ------------------------------------------------------------
 def compute_metrics(y_true, y_pred):
     print("🔹 Computing metrics...")
 
     results = {}
-    for h in range(5):
+    for h in range(y_true.shape[1]):
         true_h = y_true[:, h]
         pred_h = y_pred[:, h]
 
-        mae = np.mean(np.abs(true_h - pred_h))
-        rmse = np.sqrt(np.mean((true_h - pred_h) ** 2))
+        mae = float(np.mean(np.abs(true_h - pred_h)))
+        rmse = float(np.sqrt(np.mean((true_h - pred_h) ** 2)))
 
-        results[f"MAE_h{h+1}"] = float(mae)
-        results[f"RMSE_h{h+1}"] = float(rmse)
+        results[f"MAE_h{h+1}"] = mae
+        results[f"RMSE_h{h+1}"] = rmse
 
     return results
 
 
-# ------------------------------------------------------------
-# Full evaluation entry point
-# ------------------------------------------------------------
 def evaluate_model(X_test, y_test, ckpt_dir, seq_len, out_len, num_features=5):
     model, params = load_model(ckpt_dir, seq_len, out_len, num_features)
-
-    preds = predict(model, params, X_test)
-    preds = np.array(preds)
-
+    preds = np.array(predict(model, params, X_test))
     results = compute_metrics(y_test, preds)
     return results, preds
