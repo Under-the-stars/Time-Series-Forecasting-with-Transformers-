@@ -48,11 +48,11 @@ class TransformerBlock(nn.Module):
 
 class TimeSeriesTransformer(nn.Module):
     seq_len: int = 60
-    d_model: int = 256
-    num_heads: int = 8
-    num_layers: int = 6
-    mlp_dim: int = 512
-    dropout: float = 0.15
+    d_model: int = 128          # <-- CHANGED BACK
+    num_heads: int = 4          # <-- CHANGED BACK
+    num_layers: int = 4         # <-- CHANGED BACK
+    mlp_dim: int = 256          # <-- CHANGED BACK
+    dropout: float = 0.10
     out_len: int = 5
     num_features: int = 5
 
