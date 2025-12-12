@@ -1,65 +1,112 @@
 """
-train.py
-Training loop for multi-step Transformer forecasting
-compatible with Option C model and data.py windowing.
+train.py — Training loop for Encoder–Decoder TimeSeries Transformer
+Includes:
+- AdamW optimizer
+- Warmup + cosine decay schedule
+- Gradient clipping
+- Mini-batch validation
 """
 
-import os
 import jax
 import jax.numpy as jnp
 import optax
 import numpy as np
 from flax.training import train_state, checkpoints
+from flax import struct
 
 from model import TimeSeriesTransformer
 
 
 # ============================================================
-# Create Training State
+# Learning rate schedule: warmup + cosine decay
 # ============================================================
-def create_train_state(rng, learning_rate, seq_len, out_len, num_features):
+
+def create_learning_rate_fn(
+    base_lr=1e-3,
+    warmup_steps=500,
+    total_steps=20000,
+):
+    warmup_fn = optax.linear_schedule(
+        init_value=0.0,
+        end_value=base_lr,
+        transition_steps=warmup_steps,
+    )
+
+    cosine_fn = optax.cosine_decay_schedule(
+        init_value=base_lr,
+        decay_steps=total_steps - warmup_steps,
+    )
+
+    return optax.join_schedules(
+        schedules=[warmup_fn, cosine_fn],
+        boundaries=[warmup_steps],
+    )
+
+
+# ============================================================
+# Train State (stores params, optimizer, etc.)
+# ============================================================
+
+class TrainState(train_state.TrainState):
+    batch_stats: Any = None
+
+
+# ============================================================
+# Create model + optimizer
+# ============================================================
+
+def create_train_state(
+    rng,
+    learning_rate,
+    seq_len,
+    out_len,
+    num_features
+):
     model = TimeSeriesTransformer(
         seq_len=seq_len,
-        d_model=128,
-        num_heads=4,
-        num_layers=4,
-        mlp_dim=256,
         out_len=out_len,
         num_features=num_features,
     )
 
-    dummy_input = jnp.ones((1, seq_len, num_features))
+    dummy = jnp.ones((1, seq_len, num_features))
 
     params = model.init(
         {"params": rng, "dropout": rng},
-        dummy_input,
-        train=True
+        dummy,
+        train=True,
     )["params"]
 
-    tx = optax.adamw(learning_rate)
+    lr_schedule = create_learning_rate_fn(
+        base_lr=learning_rate,
+        warmup_steps=500,
+        total_steps=20000,
+    )
 
-    return train_state.TrainState.create(
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),   # gradient clipping
+        optax.adamw(learning_rate=lr_schedule, weight_decay=1e-4),
+    )
+
+    return TrainState(
         apply_fn=model.apply,
         params=params,
         tx=tx
     )
 
 
-
-
 # ============================================================
 # Loss Function
 # ============================================================
 
-def loss_fn(params, batch, state):
+def loss_fn(params, batch, state, rng):
     preds = state.apply_fn(
         {"params": params},
         batch["X"],
         train=True,
-        rngs={"dropout": jax.random.PRNGKey(0)}
+        rngs={"dropout": rng},
     )
-    return jnp.mean((preds - batch["y"]) ** 2)
 
+    return jnp.mean((preds - batch["y"]) ** 2)
 
 
 # ============================================================
@@ -67,9 +114,11 @@ def loss_fn(params, batch, state):
 # ============================================================
 
 @jax.jit
-def train_step(state, batch):
-    grads = jax.grad(loss_fn)(state.params, batch, state)
-    return state.apply_gradients(grads=grads)
+def train_step(state, batch, rng):
+    grad_fn = jax.value_and_grad(loss_fn)
+    loss, grads = grad_fn(state.params, batch, state, rng)
+    state = state.apply_gradients(grads=grads)
+    return state, loss
 
 
 # ============================================================
@@ -87,22 +136,17 @@ def eval_step(state, batch):
     return jnp.mean((preds - batch["y"]) ** 2)
 
 
-
 # ============================================================
-# Batch Iterator
+# Batch Generator
 # ============================================================
 
 def get_batches(X, y, batch_size):
-    n = len(X)
-    idx = np.arange(n)
+    idx = np.arange(len(X))
     np.random.shuffle(idx)
 
-    for i in range(0, n, batch_size):
-        batch_idx = idx[i:i + batch_size]
-        yield {
-            "X": jnp.array(X[batch_idx]),
-            "y": jnp.array(y[batch_idx]),
-        }
+    for i in range(0, len(X), batch_size):
+        b = idx[i:i + batch_size]
+        yield {"X": X[b], "y": y[b]}
 
 
 # ============================================================
@@ -114,14 +158,12 @@ def train_model(
     X_val, y_val,
     seq_len,
     out_len,
-    num_features=5,
+    num_features,
     batch_size=64,
-    epochs=10,
-    learning_rate=1e-4,
+    epochs=20,
+    learning_rate=1e-3,
     ckpt_dir="./checkpoints"
 ):
-
-    os.makedirs(ckpt_dir, exist_ok=True)
 
     rng = jax.random.PRNGKey(0)
 
@@ -133,35 +175,39 @@ def train_model(
         num_features
     )
 
-    best_val_loss = float("inf")
+    best_val = 9999.0
 
     for epoch in range(1, epochs + 1):
-        # -------- TRAINING --------
+        print(f"\nEpoch {epoch}/{epochs}")
         train_losses = []
+
+        # ------------- Training loop -----------------
         for batch in get_batches(X_train, y_train, batch_size):
-            state = train_step(state, batch)
-            train_losses.append(
-                float(loss_fn(state.params, batch, state))
-            )
+            rng, dropout_rng = jax.random.split(rng)
+            state, loss = train_step(state, batch, dropout_rng)
+            train_losses.append(float(loss))
 
         train_loss = np.mean(train_losses)
 
-        # -------- VALIDATION --------
-        val_batch = {
-            "X": jnp.array(X_val),
-            "y": jnp.array(y_val)
-        }
-        val_loss = float(eval_step(state, val_batch))
+        # ------------- Validation --------------------
+        val_losses = []
+        for batch in get_batches(X_val, y_val, batch_size):
+            loss = eval_step(state, batch)
+            val_losses.append(float(loss))
 
-        print(f"Epoch {epoch}/{epochs} | Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f}")
+        val_loss = np.mean(val_losses)
 
-        # -------- CHECKPOINTING --------
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        print(f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
+
+        # ------------- Checkpoint ---------------------
+        if val_loss < best_val:
+            best_val = val_loss
             checkpoints.save_checkpoint(
-                ckpt_dir, target=state.params, step=epoch, overwrite=True
+                ckpt_dir,
+                target=state.params,
+                step=epoch,
+                overwrite=True
             )
-            print("   ✔ Saved new best checkpoint.")
+            print("✔ New best checkpoint saved!")
 
-    print("Training complete.")
     return state
