@@ -1,133 +1,225 @@
 """
-data.py — Clean, correct preprocessing for AMZN stock forecasting
+Advanced data preprocessing pipeline for AMZN forecasting with:
+- OHLCV from NASDAQ dataset
+- SP500 index (^GSPC) via yfinance
+- NASDAQ Composite (^IXIC) via yfinance
+- 16 technical indicators (medium set)
+- Stationary inputs (log returns)
+- Target = 5-day future log returns
 """
 
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from sklearn.preprocessing import StandardScaler
 
 
 # ============================================================
-# 1. Load & Clean AMZN NASDAQ CSV
+# 1. Load AMZN CSV
 # ============================================================
 
 def load_amzn_csv(path):
-    """
-    Loads AMZN CSV (NASDAQ dataset) with columns:
-    Date, Low, Open, Volume, High, Close, Adjusted Close
-    """
     df = pd.read_csv(path)
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
+    df = df.sort_values("Date")
+    return df
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
-    df = df.sort_values("Date").reset_index(drop=True)
 
-    # Keep only post-IPO (AMZN IPO: May 1997)
-    df = df[df["Date"] >= "1997-05-01"]
+# ============================================================
+# 2. Download Index Data (SP500 + NASDAQ)
+# ============================================================
 
-    df = df.set_index("Date")
-
-    # Select clean feature set (order matters)
+def load_index(symbol, start):
+    df = yf.download(symbol, start=start)
     df = df[["Open", "High", "Low", "Close", "Volume"]]
+    df.index.name = "Date"
+    return df
 
-    # Remove rows with missing values
-    df = df.dropna()
+
+# ============================================================
+# 3. Technical Indicators
+# ============================================================
+
+def add_indicators(df):
+    df = df.copy()
+
+    # -------- Trend Indicators ----------
+    df["SMA_5"] = df["Close"].rolling(5).mean()
+    df["SMA_10"] = df["Close"].rolling(10).mean()
+    df["SMA_20"] = df["Close"].rolling(20).mean()
+
+    df["EMA_12"] = df["Close"].ewm(span=12).mean()
+    df["EMA_26"] = df["Close"].ewm(span=26).mean()
+
+    df["MACD"] = df["EMA_12"] - df["EMA_26"]
+    df["MACD_signal"] = df["MACD"].ewm(span=9).mean()
+
+    # -------- Momentum Indicators ----------
+    df["ROC_10"] = df["Close"].pct_change(10)
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    df["RSI"] = gain / (gain + loss)
+
+    # -------- Volatility Indicators ----------
+    df["Volatility_10"] = df["Close"].rolling(10).std()
+    df["Volatility_20"] = df["Close"].rolling(20).std()
+
+    df["ATR"] = (
+        pd.concat([
+            (df["High"] - df["Low"]),
+            (df["High"] - df["Close"].shift()).abs(),
+            (df["Low"] - df["Close"].shift()).abs()
+        ], axis=1).max(axis=1)
+    ).rolling(14).mean()
+
+    # -------- Volume Indicators ----------
+    df["Volume_z"] = (df["Volume"] - df["Volume"].rolling(20).mean()) / df["Volume"].rolling(20).std()
+    df["Volume_change"] = df["Volume"].pct_change()
 
     return df
 
 
 # ============================================================
-# 2. Create Sliding Windows
+# 4. Prepare Full Feature Set (stationary inputs)
 # ============================================================
 
-def create_windows(features, targets, seq_len=60, out_len=5):
-    """
-    features: numpy array of shape (N, num_features)
-    targets: numpy array of shape (N,)
-    Returns:
-      X: (num_samples, seq_len, num_features)
-      y: (num_samples, out_len)
-    """
+def make_stationary(df):
+    df = df.copy()
 
-    X, y = [], []
-    N = len(features)
+    df["log_return"] = np.log(df["Close"]).diff()
 
-    for i in range(N - seq_len - out_len + 1):
-        X.append(features[i : i + seq_len])
-        y.append(targets[i + seq_len : i + seq_len + out_len])
+    # Replace raw prices with log returns
+    features = [
+        "log_return",
+        "Volume_z", "Volume_change",
+        "SMA_5", "SMA_10", "SMA_20",
+        "EMA_12", "EMA_26",
+        "MACD", "MACD_signal",
+        "ROC_10",
+        "RSI",
+        "Volatility_10", "Volatility_20",
+        "ATR"
+    ]
 
-    return np.array(X), np.array(y)
+    return df[features]
 
 
 # ============================================================
-# 3. Full Dataset Pipeline
+# 5. Build Dataset with AMZN + SP500 + NASDAQ
 # ============================================================
 
-def prepare_dataset(
-    path,
-    seq_len=60,
-    out_len=5,
-    train_ratio=0.7,
-    val_ratio=0.1
-):
-    """
-    Steps:
-      1. Load AMZN NASDAQ CSV
-      2. Extract features + target
-      3. Scale features and target separately
-      4. Create sliding windows BEFORE split
-      5. Split windows into train/val/test
-    """
+def merge_sources(amzn_df):
+    start_date = amzn_df["Date"].min()
 
-    print("🔹 Loading AMZN NASDAQ data...")
-    df = load_amzn_csv(path)
+    sp500 = load_index("^GSPC", start_date)
+    nasdaq = load_index("^IXIC", start_date)
 
-    values = df.values
-    close_prices = df["Close"].values.reshape(-1, 1)
+    sp500["sp500_ret"] = np.log(sp500["Close"]).diff()
+    nasdaq["nasdaq_ret"] = np.log(nasdaq["Close"]).diff()
 
-    # ---------------------------------------------------------
-    # Scale X and y separately (correct way)
-    # ---------------------------------------------------------
-    print("🔹 Scaling features and target...")
+    # Keep only market returns
+    sp500 = sp500[["sp500_ret"]]
+    nasdaq = nasdaq[["nasdaq_ret"]]
 
-    scaler_x = StandardScaler()
-    scaler_y = StandardScaler()
+    amzn = amzn_df.set_index("Date")
 
-    scaled_x = scaler_x.fit_transform(values)
-    scaled_y = scaler_y.fit_transform(close_prices)
+    # Add indicators & stationary transform
+    amzn = add_indicators(amzn)
+    amzn = make_stationary(amzn)
 
-    # ---------------------------------------------------------
-    # Create windows BEFORE split
-    # ---------------------------------------------------------
-    print("🔹 Creating windows...")
+    # Merge everything
+    merged = amzn.join(sp500, how="left").join(nasdaq, how="left")
 
-    X_all, y_all = create_windows(
-        scaled_x,
-        scaled_y.flatten(),
-        seq_len=seq_len,
-        out_len=out_len
-    )
+    # Fill missing index values
+    merged = merged.ffill().dropna()
 
-    num_samples = len(X_all)
-    train_end = int(num_samples * train_ratio)
-    val_end = int(num_samples * (train_ratio + val_ratio))
+    return merged
 
-    # ---------------------------------------------------------
-    # Time-aware split
-    # ---------------------------------------------------------
-    print("🔹 Splitting into train/val/test...")
 
-    X_train, y_train = X_all[:train_end], y_all[:train_end]
-    X_val,   y_val   = X_all[train_end:val_end], y_all[train_end:val_end]
-    X_test,  y_test  = X_all[val_end:], y_all[val_end:]
+# ============================================================
+# 6. Create Multi-Step Targets (future 5-day returns)
+# ============================================================
 
-    print(" Dataset ready!")
-    print(f"Train: {X_train.shape}")
-    print(f"Val:   {X_val.shape}")
-    print(f"Test:  {X_test.shape}")
+def create_targets(df, horizon=5):
+    close = df["log_return"]  # Already stationary
+
+    y = []
+
+    for i in range(len(close) - horizon):
+        future_returns = close.iloc[i+1:i+1+horizon].values
+        y.append(future_returns)
+
+    y = np.array(y)
+
+    return y
+
+
+# ============================================================
+# 7. Sliding Windows
+# ============================================================
+
+def create_windows(X, y, seq_len):
+    X_windows = []
+    y_windows = []
+
+    for i in range(len(X) - seq_len - 5):
+        X_windows.append(X[i:i+seq_len])
+        y_windows.append(y[i+seq_len])
+
+    return np.array(X_windows), np.array(y_windows)
+
+
+# ============================================================
+# 8. Train/Val/Test Split
+# ============================================================
+
+def split_time_series(X, y):
+    n = len(X)
+    train = int(n * 0.7)
+    val = int(n * 0.1) + train
 
     return (
-        X_train, y_train,
-        X_val,   y_val,
-        X_test,  y_test,
-        scaler_x, scaler_y
+        X[:train], y[:train],
+        X[train:val], y[train:val],
+        X[val:], y[val:]
     )
+
+
+# ============================================================
+# 9. Main Dataset Preparation Function
+# ============================================================
+
+def prepare_dataset(amzn_path, seq_len=60, horizon=5):
+
+    print("🔹 Loading AMZN...")
+    amzn_df = load_amzn_csv(amzn_path)
+
+    print("🔹 Merging AMZN + SP500 + NASDAQ...")
+    full_df = merge_sources(amzn_df)
+
+    print("🔹 Creating targets...")
+    y = create_targets(full_df, horizon)
+
+    print("🔹 Extracting features...")
+    X = full_df.values[:-horizon]
+
+    print("🔹 Scaling X and y separately...")
+    scaler_x = StandardScaler().fit(X)
+    scaler_y = StandardScaler().fit(y)
+
+    X = scaler_x.transform(X)
+    y = scaler_y.transform(y)
+
+    print("🔹 Creating windows...")
+    Xw, yw = create_windows(X, y, seq_len)
+
+    print("🔹 Splitting train/val/test...")
+    X_train, y_train, X_val, y_val, X_test, y_test = split_time_series(Xw, yw)
+
+    print("✅ Dataset ready!")
+    print("Train:", X_train.shape)
+    print("Val:", X_val.shape)
+    print("Test:", X_test.shape)
+
+    return X_train, y_train, X_val, y_val, X_test, y_test, scaler_x, scaler_y
