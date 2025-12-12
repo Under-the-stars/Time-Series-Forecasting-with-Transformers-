@@ -1,7 +1,5 @@
 """
-data.py
-Full preprocessing pipeline for 5-step stock forecasting
-compatible with Option C Transformer model.
+data.py — Clean, correct preprocessing for AMZN stock forecasting
 """
 
 import pandas as pd
@@ -10,166 +8,126 @@ from sklearn.preprocessing import StandardScaler
 
 
 # ============================================================
-# Load Raw CSV (Ticker)
+# 1. Load & Clean AMZN NASDAQ CSV
 # ============================================================
 
-def load_ticker_csv(path):
+def load_amzn_csv(path):
     """
-    Loads raw ticker CSV using the known column order:
+    Loads AMZN CSV (NASDAQ dataset) with columns:
     Date, Low, Open, Volume, High, Close, Adjusted Close
     """
     df = pd.read_csv(path)
 
-    # Convert Date column
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
     df = df.sort_values("Date").reset_index(drop=True)
 
-    return df
+    # Keep only post-IPO (AMZN IPO: May 1997)
+    df = df[df["Date"] >= "1997-05-01"]
 
-
-# ============================================================
-# Clean + Select Columns
-# ============================================================
-
-def clean_and_select(df):
-    """
-    Keeps only the 5 features we use as inputs:
-    Open, High, Low, Close, Volume
-
-    Given the CSV column order:
-    Date, Low, Open, Volume, High, Close, Adjusted Close
-    """
-
-    df = df.copy()
-
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-    df = df.sort_values("Date")
     df = df.set_index("Date")
 
-    # Resample to business days & forward-fill missing days
-    df = df.asfreq("B").ffill()
+    # Select clean feature set (order matters)
+    df = df[["Open", "High", "Low", "Close", "Volume"]]
 
-    # Select the 5 input features in correct order
-    df = df[[
-        "Open",      # index 2
-        "High",      # index 4
-        "Low",       # index 1
-        "Close",     # index 5
-        "Volume"     # index 3
-    ]]
+    # Remove rows with missing values
+    df = df.dropna()
 
     return df
 
 
 # ============================================================
-# Scaling (Train-only fit)
+# 2. Create Sliding Windows
 # ============================================================
 
-def scale_features(df):
+def create_windows(features, targets, seq_len=60, out_len=5):
     """
-    Fits scaler ONLY on training portion to avoid leakage.
-    Returns scaled DataFrame and fitted scaler.
+    features: numpy array of shape (N, num_features)
+    targets: numpy array of shape (N,)
+    Returns:
+      X: (num_samples, seq_len, num_features)
+      y: (num_samples, out_len)
     """
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(df)
-    scaled_df = pd.DataFrame(scaled, columns=df.columns, index=df.index)
-    return scaled_df, scaler
 
-
-def transform_with_scaler(df, scaler):
-    scaled = scaler.transform(df)
-    return pd.DataFrame(scaled, columns=df.columns, index=df.index)
-
-
-# ============================================================
-# Multi-Step Windowing (60 → next 5)
-# ============================================================
-
-def create_windows_multi_step(data, seq_len=60, out_len=5):
-    """
-    data: numpy array of shape (num_timesteps, num_features)
-    outputs:
-       X: (num_samples, seq_len, num_features)
-       y: (num_samples, out_len)
-    """
     X, y = [], []
-    close_idx = 3  # Close is 4th column in our selected features
+    N = len(features)
 
-    for i in range(len(data) - seq_len - out_len + 1):
-        X.append(data[i : i + seq_len])  
-        y.append(data[i + seq_len : i + seq_len + out_len, close_idx])
+    for i in range(N - seq_len - out_len + 1):
+        X.append(features[i : i + seq_len])
+        y.append(targets[i + seq_len : i + seq_len + out_len])
 
     return np.array(X), np.array(y)
 
 
 # ============================================================
-# Train/Val/Test Split
+# 3. Full Dataset Pipeline
 # ============================================================
 
-def split_data(X, y, train_ratio=0.7, val_ratio=0.1):
+def prepare_dataset(
+    path,
+    seq_len=60,
+    out_len=5,
+    train_ratio=0.7,
+    val_ratio=0.1
+):
     """
-    Time-aware split:
-    70% train, 10% validation, 20% test
-    """
-
-    n = len(X)
-    train_end = int(n * train_ratio)
-    val_end = int(n * (train_ratio + val_ratio))
-
-    X_train = X[:train_end]
-    y_train = y[:train_end]
-
-    X_val = X[train_end:val_end]
-    y_val = y[train_end:val_end]
-
-    X_test = X[val_end:]
-    y_test = y[val_end:]
-
-    return X_train, y_train, X_val, y_val, X_test, y_test
-
-
-# ============================================================
-# Full Pipeline
-# ============================================================
-
-def prepare_dataset(path, seq_len=60, out_len=5):
-    """
-    Full pipeline:
-    - load CSV
-    - clean + resample
-    - split train/val/test before scaling
-    - scale features using ONLY train split
-    - create windows for all splits
+    Steps:
+      1. Load AMZN NASDAQ CSV
+      2. Extract features + target
+      3. Scale features and target separately
+      4. Create sliding windows BEFORE split
+      5. Split windows into train/val/test
     """
 
-    print("🔹 Loading raw data...")
-    df = load_ticker_csv(path)
+    print("🔹 Loading AMZN NASDAQ data...")
+    df = load_amzn_csv(path)
 
-    print("🔹 Cleaning & selecting columns...")
-    df = clean_and_select(df)
-
-    print("🔹 Splitting before scaling...")
-    # Convert to numpy for splitting
     values = df.values
-    n = len(df)
-    train_end = int(n * 0.7)
-    val_end = int(n * 0.8)
+    close_prices = df["Close"].values.reshape(-1, 1)
 
-    df_train = df.iloc[:train_end]
-    df_val = df.iloc[train_end:val_end]
-    df_test = df.iloc[val_end:]
+    # ---------------------------------------------------------
+    # Scale X and y separately (correct way)
+    # ---------------------------------------------------------
+    print("🔹 Scaling features and target...")
 
-    print("🔹 Scaling (train-only fit)...")
-    df_train_scaled, scaler = scale_features(df_train)
-    df_val_scaled = transform_with_scaler(df_val, scaler)
-    df_test_scaled = transform_with_scaler(df_test, scaler)
+    scaler_x = StandardScaler()
+    scaler_y = StandardScaler()
 
+    scaled_x = scaler_x.fit_transform(values)
+    scaled_y = scaler_y.fit_transform(close_prices)
+
+    # ---------------------------------------------------------
+    # Create windows BEFORE split
+    # ---------------------------------------------------------
     print("🔹 Creating windows...")
-    X_train, y_train = create_windows_multi_step(df_train_scaled.values, seq_len, out_len)
-    X_val, y_val = create_windows_multi_step(df_val_scaled.values, seq_len, out_len)
-    X_test, y_test = create_windows_multi_step(df_test_scaled.values, seq_len, out_len)
 
-    print("✅ Dataset ready!")
-    print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+    X_all, y_all = create_windows(
+        scaled_x,
+        scaled_y.flatten(),
+        seq_len=seq_len,
+        out_len=out_len
+    )
 
-    return X_train, y_train, X_val, y_val, X_test, y_test, scaler
+    num_samples = len(X_all)
+    train_end = int(num_samples * train_ratio)
+    val_end = int(num_samples * (train_ratio + val_ratio))
+
+    # ---------------------------------------------------------
+    # Time-aware split
+    # ---------------------------------------------------------
+    print("🔹 Splitting into train/val/test...")
+
+    X_train, y_train = X_all[:train_end], y_all[:train_end]
+    X_val,   y_val   = X_all[train_end:val_end], y_all[train_end:val_end]
+    X_test,  y_test  = X_all[val_end:], y_all[val_end:]
+
+    print(" Dataset ready!")
+    print(f"Train: {X_train.shape}")
+    print(f"Val:   {X_val.shape}")
+    print(f"Test:  {X_test.shape}")
+
+    return (
+        X_train, y_train,
+        X_val,   y_val,
+        X_test,  y_test,
+        scaler_x, scaler_y
+    )
