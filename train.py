@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import optax
 import numpy as np
 from flax.training import train_state, checkpoints
-from flax import struct
+from typing import Any
 
 from model import TimeSeriesTransformer
 
@@ -44,15 +44,7 @@ def create_learning_rate_fn(
 
 
 # ============================================================
-# Train State (stores params, optimizer, etc.)
-# ============================================================
-
-class TrainState(train_state.TrainState):
-    batch_stats: Any = None
-
-
-# ============================================================
-# Create model + optimizer
+# Create Train State (Model + Optimizer)
 # ============================================================
 
 def create_train_state(
@@ -73,7 +65,7 @@ def create_train_state(
     params = model.init(
         {"params": rng, "dropout": rng},
         dummy,
-        train=True,
+        train=True
     )["params"]
 
     lr_schedule = create_learning_rate_fn(
@@ -83,11 +75,14 @@ def create_train_state(
     )
 
     tx = optax.chain(
-        optax.clip_by_global_norm(1.0),   # gradient clipping
-        optax.adamw(learning_rate=lr_schedule, weight_decay=1e-4),
+        optax.clip_by_global_norm(1.0),     # gradient clipping
+        optax.adamw(
+            learning_rate=lr_schedule,
+            weight_decay=1e-4
+        ),
     )
 
-    return TrainState(
+    return train_state.TrainState.create(
         apply_fn=model.apply,
         params=params,
         tx=tx
@@ -105,7 +100,6 @@ def loss_fn(params, batch, state, rng):
         train=True,
         rngs={"dropout": rng},
     )
-
     return jnp.mean((preds - batch["y"]) ** 2)
 
 
@@ -181,7 +175,7 @@ def train_model(
         print(f"\nEpoch {epoch}/{epochs}")
         train_losses = []
 
-        # ------------- Training loop -----------------
+        # ------------------- TRAINING -------------------
         for batch in get_batches(X_train, y_train, batch_size):
             rng, dropout_rng = jax.random.split(rng)
             state, loss = train_step(state, batch, dropout_rng)
@@ -189,7 +183,7 @@ def train_model(
 
         train_loss = np.mean(train_losses)
 
-        # ------------- Validation --------------------
+        # ------------------- VALIDATION -------------------
         val_losses = []
         for batch in get_batches(X_val, y_val, batch_size):
             loss = eval_step(state, batch)
@@ -199,7 +193,7 @@ def train_model(
 
         print(f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
-        # ------------- Checkpoint ---------------------
+        # ------------------- CHECKPOINT -------------------
         if val_loss < best_val:
             best_val = val_loss
             checkpoints.save_checkpoint(
