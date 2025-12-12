@@ -1,16 +1,50 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+
+# ============================================================
+# LOAD AMZN CSV (your original loader)
+# ============================================================
+
+def load_ticker_csv(path):
+    df = pd.read_csv(path)
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df = df.sort_values("Date").set_index("Date")
+    return df
+
+# Alias — use generic loader for AMZN
+def load_amzn_csv(path):
+    return load_ticker_csv(path)
+
+
+# ============================================================
+# PRICE TARGETS (future close prices)
+# ============================================================
+
 def create_price_targets(df, horizon=5):
     """
-    Predict next 5 CLOSE prices.
-    target[t] = [Close[t+1], Close[t+2], ..., Close[t+horizon]]
+    Find AMZN close column from merged dataset,
+    then create multi-step future price targets.
     """
-    close = df["Close"].values
+    # Detect the AMZN Close column (after merge)
+    close_cols = [c for c in df.columns if "Close" in c and "AMZN" in c]
+    if len(close_cols) == 0:
+        raise KeyError("No AMZN Close column found in merged dataframe!")
+    close_col = close_cols[0]
+
+    close = df[close_col].values
     y = []
 
     for i in range(len(close) - horizon):
         y.append(close[i+1:i+1+horizon])
 
-    return np.array(y)
+    return np.array(y), close_col
 
+
+# ============================================================
+# FULL DATASET PIPELINE
+# ============================================================
 
 def prepare_dataset(amzn_path, seq_len=60, horizon=5):
     print("🔹 Loading AMZN...")
@@ -20,7 +54,7 @@ def prepare_dataset(amzn_path, seq_len=60, horizon=5):
     full_df = merge_sources(amzn_df)
 
     print("🔹 Creating targets (future CLOSE prices)...")
-    y = create_price_targets(full_df, horizon)
+    y, close_col = create_price_targets(full_df, horizon)
 
     # Align X with y
     X = full_df.iloc[:-horizon].values
@@ -29,19 +63,11 @@ def prepare_dataset(amzn_path, seq_len=60, horizon=5):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    # Scale y using same scaler (but only Close column!)
-    close_col = list(full_df.columns).index("Close")
-    y_scaled = (y - scaler.mean_[close_col]) / scaler.scale_[close_col]
+    # Scale y using the close column's mean and std from scaler
+    close_idx = full_df.columns.tolist().index(close_col)
+    y_scaled = (y - scaler.mean_[close_idx]) / scaler.scale_[close_idx]
 
     print("🔹 Creating windows...")
     Xw, yw = create_windows(X_scaled, y_scaled, seq_len)
 
-    print("🔹 Splitting train/val/test...")
-    X_train, y_train, X_val, y_val, X_test, y_test = split_time_series(Xw, yw)
-
-    print("✅ Dataset ready!")
-    print("Train:", X_train.shape)
-    print("Val:",   X_val.shape)
-    print("Test:",  X_test.shape)
-
-    return X_train, y_train, X_val, y_val, X_test, y_test, scaler
+    pri
