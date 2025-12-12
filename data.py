@@ -4,70 +4,86 @@ from sklearn.preprocessing import StandardScaler
 
 
 # ============================================================
-# LOAD AMZN CSV (your original loader)
+# LOAD AMZN CSV FILE
 # ============================================================
-
 def load_ticker_csv(path):
     df = pd.read_csv(path)
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.sort_values("Date").set_index("Date")
     return df
 
-# Alias — use generic loader for AMZN
-def load_amzn_csv(path):
-    return load_ticker_csv(path)
-
 
 # ============================================================
-# PRICE TARGETS (future close prices)
+# CREATE 5-STEP FUTURE TARGETS FROM CLOSE PRICE
 # ============================================================
-
 def create_price_targets(df, horizon=5):
     """
-    Find AMZN close column from merged dataset,
-    then create multi-step future price targets.
+    horizon = number of future steps (e.g., next 5 days)
+    Returns: y shape = (num_samples, horizon)
     """
-    # Detect the AMZN Close column (after merge)
-    close_cols = [c for c in df.columns if "Close" in c and "AMZN" in c]
-    if len(close_cols) == 0:
-        raise KeyError("No AMZN Close column found in merged dataframe!")
-    close_col = close_cols[0]
 
-    close = df[close_col].values
+    close = df["Close"].values
     y = []
 
     for i in range(len(close) - horizon):
-        y.append(close[i+1:i+1+horizon])
+        y.append(close[i+1 : i+1+horizon])
 
-    return np.array(y), close_col
+    return np.array(y)
 
 
 # ============================================================
-# FULL DATASET PIPELINE
+# CREATE INPUT WINDOWS (X) USING SLIDING WINDOW
 # ============================================================
+def create_windows(X, y, seq_len):
+    """
+    X: scaled features array
+    y: scaled targets array
+    seq_len: number of lookback timesteps (e.g., 60)
+    """
+    X_out, y_out = [], []
+    for i in range(len(X) - seq_len):
+        X_out.append(X[i:i+seq_len])
+        y_out.append(y[i+seq_len-1])  # match alignment
 
-def prepare_dataset(amzn_path, seq_len=60, horizon=5):
-    print("🔹 Loading AMZN...")
-    amzn_df = load_amzn_csv(amzn_path)
+    return np.array(X_out), np.array(y_out)
 
-    print("🔹 Merging AMZN + SP500 + NASDAQ...")
-    full_df = merge_sources(amzn_df)
 
-    print("🔹 Creating targets (future CLOSE prices)...")
-    y, close_col = create_price_targets(full_df, horizon)
+# ============================================================
+# FULL DATA PREPARATION PIPELINE FOR AMZN ONLY
+# ============================================================
+def prepare_dataset(path, seq_len=60, horizon=5):
+    print("🔹 Loading AMZN data...")
+    df = load_ticker_csv(path)
 
-    # Align X with y
-    X = full_df.iloc[:-horizon].values
+    print("🔹 Creating future targets...")
+    y_raw = create_price_targets(df, horizon)
 
-    print("🔹 Scaling X and y together...")
+    print("🔹 Aligning features with targets...")
+    X_raw = df.iloc[:-horizon].values
+
+    print("🔹 Scaling features and targets...")
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X_raw)
 
-    # Scale y using the close column's mean and std from scaler
-    close_idx = full_df.columns.tolist().index(close_col)
-    y_scaled = (y - scaler.mean_[close_idx]) / scaler.scale_[close_idx]
+    # Scale y using CLOSE column's mean/std
+    close = df["Close"].values
+    close_mean = close.mean()
+    close_std = close.std()
+    y_scaled = (y_raw - close_mean) / close_std
 
-    print("🔹 Creating windows...")
-    Xw, yw = create_windows(X_scaled, y_scaled, seq_len)
+    print("🔹 Building sliding windows...")
+    X, y = create_windows(X_scaled, y_scaled, seq_len)
 
-    pri
+    print("🔹 Splitting dataset (70/10/20)...")
+    n = len(X)
+    train_end = int(n * 0.7)
+    val_end = int(n * 0.8)
+
+    X_train, y_train = X[:train_end], y[:train_end]
+    X_val, y_val = X[train_end:val_end], y[train_end:val_end]
+    X_test, y_test = X[val_end:], y[val_end:]
+
+    print("✅ AMZN dataset ready!")
+    print(f"Train: {X_train.shape}, Val: {X_val.shape}, Test: {X_test.shape}")
+
+    return X_train, y_train, X_val, y_val, X_test, y_test, scaler
