@@ -1,10 +1,10 @@
 """
-train.py — Training loop for Encoder–Decoder TimeSeries Transformer
-Includes:
+train.py — Training loop for TimeSeries Transformer
+Supports:
 - AdamW optimizer
-- Warmup + cosine decay schedule
+- Cosine LR schedule with warmup
 - Gradient clipping
-- Mini-batch validation
+- Batch-wise validation
 """
 
 import jax
@@ -12,13 +12,12 @@ import jax.numpy as jnp
 import optax
 import numpy as np
 from flax.training import train_state, checkpoints
-from typing import Any
 
 from model import TimeSeriesTransformer
 
 
 # ============================================================
-# Learning rate schedule: warmup + cosine decay
+# Learning Rate Schedule (Warmup + Cosine Decay)
 # ============================================================
 
 def create_learning_rate_fn(
@@ -44,7 +43,7 @@ def create_learning_rate_fn(
 
 
 # ============================================================
-# Create Train State (Model + Optimizer)
+# Create Train State
 # ============================================================
 
 def create_train_state(
@@ -54,13 +53,16 @@ def create_train_state(
     out_len,
     num_features
 ):
+    # -------------------------------------------------------
+    # FIXED: ALWAYS use num_features=6 to match saved weights
+    # -------------------------------------------------------
     model = TimeSeriesTransformer(
         seq_len=seq_len,
         out_len=out_len,
-        num_features=num_features,
+        num_features=6     # <<── HARD-SET FOR CHECKPOINT COMPATIBILITY
     )
 
-    dummy = jnp.ones((1, seq_len, num_features))
+    dummy = jnp.ones((1, seq_len, 6))  # <<── MUST MATCH num_features=6
 
     params = model.init(
         {"params": rng, "dropout": rng},
@@ -75,7 +77,7 @@ def create_train_state(
     )
 
     tx = optax.chain(
-        optax.clip_by_global_norm(1.0),     # gradient clipping
+        optax.clip_by_global_norm(1.0),
         optax.adamw(
             learning_rate=lr_schedule,
             weight_decay=1e-4
@@ -125,7 +127,7 @@ def eval_step(state, batch):
         {"params": state.params},
         batch["X"],
         train=False,
-        rngs={"dropout": jax.random.PRNGKey(0)}
+        rngs={"dropout": jax.random.PRNGKey(0)},
     )
     return jnp.mean((preds - batch["y"]) ** 2)
 
@@ -140,7 +142,10 @@ def get_batches(X, y, batch_size):
 
     for i in range(0, len(X), batch_size):
         b = idx[i:i + batch_size]
-        yield {"X": X[b], "y": y[b]}
+        yield {
+            "X": X[b],
+            "y": y[b]
+        }
 
 
 # ============================================================
@@ -152,7 +157,7 @@ def train_model(
     X_val, y_val,
     seq_len,
     out_len,
-    num_features,
+    num_features,   # ignored, because checkpoint must use 6
     batch_size=64,
     epochs=20,
     learning_rate=1e-3,
@@ -166,16 +171,16 @@ def train_model(
         learning_rate,
         seq_len,
         out_len,
-        num_features
+        num_features=6   # <<── FORCE 6-FEATURE MODEL
     )
 
-    best_val = 9999.0
+    best_val = float("inf")
 
     for epoch in range(1, epochs + 1):
         print(f"\nEpoch {epoch}/{epochs}")
         train_losses = []
 
-        # ------------------- TRAINING -------------------
+        # ----------------------- TRAIN LOOP -----------------------
         for batch in get_batches(X_train, y_train, batch_size):
             rng, dropout_rng = jax.random.split(rng)
             state, loss = train_step(state, batch, dropout_rng)
@@ -183,7 +188,7 @@ def train_model(
 
         train_loss = np.mean(train_losses)
 
-        # ------------------- VALIDATION -------------------
+        # ----------------------- VALIDATION -----------------------
         val_losses = []
         for batch in get_batches(X_val, y_val, batch_size):
             loss = eval_step(state, batch)
@@ -193,7 +198,7 @@ def train_model(
 
         print(f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}")
 
-        # ------------------- CHECKPOINT -------------------
+        # ----------------------- CHECKPOINT -----------------------
         if val_loss < best_val:
             best_val = val_loss
             checkpoints.save_checkpoint(
