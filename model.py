@@ -1,180 +1,66 @@
-"""
-model.py — Encoder–Decoder Transformer for Multi-Step Time Series Forecasting
-"""
-
 import jax.numpy as jnp
 import flax.linen as nn
-from typing import Any
-
-
-# ============================================================
-# Positional Encoding (learnable)
-# ============================================================
 
 class PositionalEncoding(nn.Module):
     d_model: int
-    max_len: int = 5000
 
     @nn.compact
     def __call__(self, x):
-        """
-        x: (batch, seq_len, d_model)
-        returns: (batch, seq_len, d_model)
-        """
-        seq_len = x.shape[1]
-
-        pos_emb = self.param(
-            "pos_embedding",
-            nn.initializers.normal(stddev=0.02),
-            (self.max_len, self.d_model)
+        pos = self.param(
+            "pos",
+            nn.initializers.normal(stddev=0.01),
+            (5000, self.d_model)
         )
+        return x + pos[:x.shape[1]]
 
-        return x + pos_emb[:seq_len, :]
 
-
-# ============================================================
-# Transformer Encoder Block
-# ============================================================
-
-class EncoderBlock(nn.Module):
+class TransformerBlock(nn.Module):
     d_model: int
     num_heads: int
     mlp_dim: int
-    dropout: float = 0.1
 
     @nn.compact
-    def __call__(self, x, train: bool = True):
+    def __call__(self, x, train=True):
 
-        # Self Attention
-        x_norm = nn.LayerNorm()(x)
         attn = nn.SelfAttention(
             num_heads=self.num_heads,
             qkv_features=self.d_model,
-            dropout_rate=self.dropout,
-        )(x_norm, deterministic=not train)
-        x = x + attn
+            dropout_rate=0.0,   # NO DROPOUT
+        )
+        x2 = attn(x, deterministic=True)
+        x = nn.LayerNorm()(x + x2)
 
-        # MLP
-        x_norm = nn.LayerNorm()(x)
-        mlp = nn.Dense(self.mlp_dim)(x_norm)
-        mlp = nn.gelu(mlp)
-        mlp = nn.Dropout(self.dropout)(mlp, deterministic=not train)
-        mlp = nn.Dense(self.d_model)(mlp)
+        x2 = nn.Dense(self.mlp_dim)(x)
+        x2 = nn.gelu(x2)
+        x2 = nn.Dense(self.d_model)(x2)
 
-        return x + mlp
+        x = nn.LayerNorm()(x + x2)
+        return x
 
-
-# ============================================================
-# Transformer Decoder Block (cross-attention)
-# ============================================================
-
-class DecoderBlock(nn.Module):
-    d_model: int
-    num_heads: int
-    mlp_dim: int
-    dropout: float = 0.1
-
-    @nn.compact
-    def __call__(self, x, enc_out, train: bool = True):
-        """
-        x: decoder queries (batch, out_len, d_model)
-        enc_out: encoder output (batch, seq_len, d_model)
-        """
-
-        # Self-Attention (decoder)
-        x_norm = nn.LayerNorm()(x)
-        attn = nn.SelfAttention(
-            num_heads=self.num_heads,
-            qkv_features=self.d_model,
-            dropout_rate=self.dropout,
-        )(x_norm, deterministic=not train)
-        x = x + attn
-
-        # Cross Attention
-        x_norm = nn.LayerNorm()(x)
-        cross = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
-            dropout_rate=self.dropout
-        )(x_norm, enc_out, deterministic=not train)
-        x = x + cross
-
-        # MLP
-        x_norm = nn.LayerNorm()(x)
-        mlp = nn.Dense(self.mlp_dim)(x_norm)
-        mlp = nn.gelu(mlp)
-        mlp = nn.Dropout(self.dropout)(mlp, deterministic=not train)
-        mlp = nn.Dense(self.d_model)(mlp)
-
-        return x + mlp
-
-
-# ============================================================
-# Full Transformer Model
-# ============================================================
 
 class TimeSeriesTransformer(nn.Module):
-    seq_len: int
-    out_len: int
-    num_features: int
+    seq_len: int = 60
     d_model: int = 128
     num_heads: int = 4
-    num_layers: int = 3
+    num_layers: int = 4
     mlp_dim: int = 256
-    dropout: float = 0.1
+    out_len: int = 5
+    num_features: int = 6   # ← MATCH THE CHECKPOINT (6 FEATURES)
 
     @nn.compact
-    def __call__(self, x, train: bool = True):
-        """
-        x: (batch, seq_len, num_features)
-        returns: (batch, out_len)
-        """
+    def __call__(self, x, train=True):
 
-        # ====================================================
-        # 1. Input Projection
-        # ====================================================
+        # x shape must be (batch, seq_len, 6)
         x = nn.Dense(self.d_model)(x)
 
-        # Add positional encoding
         x = PositionalEncoding(self.d_model)(x)
 
-        # ====================================================
-        # 2. Encoder
-        # ====================================================
         for _ in range(self.num_layers):
-            x = EncoderBlock(
+            x = TransformerBlock(
                 self.d_model,
                 self.num_heads,
-                self.mlp_dim,
-                self.dropout,
+                self.mlp_dim
             )(x, train=train)
-        
-        encoder_output = x  # (batch, seq_len, d_model)
 
-        # ====================================================
-        # 3. Decoder: Learnable Horizon Queries
-        # ====================================================
-        horizon_queries = self.param(
-            "horizon_queries",
-            nn.initializers.normal(stddev=0.02),
-            (self.out_len, self.d_model),
-        )
-
-        # Repeat queries for batch
-        q = jnp.tile(horizon_queries[None, :, :], (x.shape[0], 1, 1))
-
-        # Decoder blocks
-        for _ in range(self.num_layers):
-            q = DecoderBlock(
-                self.d_model,
-                self.num_heads,
-                self.mlp_dim,
-                self.dropout
-            )(q, encoder_output, train=train)
-
-        # ====================================================
-        # 4. Output Head: Predict Close price for each horizon
-        # ====================================================
-        out = nn.Dense(1)(q)          # (batch, out_len, 1)
-        out = out.squeeze(-1)         # (batch, out_len)
-
-        return out
+        last = x[:, -1]
+        return nn.Dense(self.out_len)(last)
